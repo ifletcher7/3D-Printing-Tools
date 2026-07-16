@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Navisworks Import Cleanup",
     "author": "Your Name",
-    "version": (0, 4, 0),
+    "version": (0, 4, 1),
     "blender": (5, 0, 0),
     "location": "View3D > Sidebar > Navisworks",
     "description": (
@@ -17,6 +17,14 @@ from mathutils import Vector
 from bpy.props import BoolProperty, FloatVectorProperty, StringProperty
 from bpy.types import Operator, Panel, PropertyGroup
 from bpy_extras.io_utils import ImportHelper
+
+
+DISCIPLINE_HINTS = (
+    ("Structural", ("strsteel", "structural", "steel", "beam", "column", "brace")),
+    ("Concrete", ("concrete", "foundation", "footing", "slab", "pedestal")),
+    ("Mechanical", ("mechanical", "mech", "pipe", "piping", "duct", "hvac", "equipment")),
+    ("Electrical", ("electrical", "cable", "conduit", "tray", "power")),
+)
 
 
 def collect_mesh_descendants(root_objects):
@@ -112,6 +120,101 @@ def remove_empty_objects(objects):
     return removed_count
 
 
+def iter_ancestors(obj):
+    """Yield the ancestor chain for an object from nearest to furthest."""
+    current = obj.parent
+
+    while current is not None:
+        yield current
+        current = current.parent
+
+
+def normalize_metadata_value(value):
+    """Convert Blender custom-property values into strings."""
+    if value is None:
+        return ""
+
+    if isinstance(value, (list, tuple)):
+        return ", ".join(str(item) for item in value)
+
+    return str(value)
+
+
+def get_first_non_empty_metadata(ancestors, property_names):
+    """Find the first non-empty ancestor property using the supplied fallbacks."""
+    for property_name in property_names:
+        for ancestor in ancestors:
+            if property_name not in ancestor.keys():
+                continue
+
+            value = normalize_metadata_value(ancestor[property_name]).strip()
+
+            if value:
+                return value
+
+    return ""
+
+
+def infer_discipline(ancestor_names, section_name, material_name):
+    """Infer a likely discipline from the ancestor hierarchy and metadata."""
+    search_text = " ".join(
+        part
+        for part in (
+            *ancestor_names,
+            section_name,
+            material_name,
+        )
+        if part
+    ).lower()
+
+    for label, tokens in DISCIPLINE_HINTS:
+        if any(token in search_text for token in tokens):
+            return label
+
+    return "Unknown"
+
+
+def copy_ancestor_metadata_to_meshes(meshes):
+    """Preserve important ancestor metadata on each mesh before cleanup."""
+    for mesh in meshes:
+        ancestors = list(iter_ancestors(mesh))
+        ancestor_names = [ancestor.name for ancestor in reversed(ancestors)]
+        hierarchy_path = " > ".join(ancestor_names + [mesh.name])
+        section_name = get_first_non_empty_metadata(
+            ancestors,
+            ("SmartPlant 3D - Section Name",),
+        )
+        material_name = get_first_non_empty_metadata(
+            ancestors,
+            ("SmartPlant 3D - Material", "Item - Material"),
+        )
+
+        mesh["Navisworks - Hierarchy Path"] = hierarchy_path
+        mesh["Navisworks - Discipline"] = infer_discipline(
+            ancestor_names,
+            section_name,
+            material_name,
+        )
+        mesh["Navisworks - GUID"] = get_first_non_empty_metadata(
+            ancestors,
+            ("Item - GUID",),
+        )
+        mesh["Navisworks - Section Name"] = section_name
+        mesh["Navisworks - Cut Length"] = get_first_non_empty_metadata(
+            ancestors,
+            ("SmartPlant 3D - Cut Length",),
+        )
+        mesh["Navisworks - Location"] = get_first_non_empty_metadata(
+            ancestors,
+            ("SmartPlant 3D - Location",),
+        )
+        mesh["Navisworks - Material"] = material_name
+        mesh["Navisworks - Source File"] = get_first_non_empty_metadata(
+            ancestors,
+            ("Item - Source File Name", "Item - Source File"),
+        )
+
+
 def clean_imported_objects(context, source_objects):
     """
     Extract meshes, preserve world transforms, remove parenting,
@@ -127,6 +230,8 @@ def clean_imported_objects(context, source_objects):
         raise RuntimeError(
             "No mesh objects were found in the imported FBX"
         )
+
+    copy_ancestor_metadata_to_meshes(meshes)
 
     world_matrices = {
         obj: obj.matrix_world.copy()
@@ -333,4 +438,3 @@ def unregister():
 
 if __name__ == "__main__":
     register()
-
